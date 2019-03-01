@@ -6,6 +6,7 @@ Each modification triggers a new commit.
 
 ## TODO
 - Add better commit messages
+- File permissions
 - Increase performance
 
 ## Known issues
