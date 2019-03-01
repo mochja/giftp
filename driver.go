@@ -39,11 +39,6 @@ func (f *FileInfo) Group() string {
 	return f.group
 }
 
-func (driver *GitDriver) realPath(path string) string {
-	paths := strings.Split(path, "/")
-	return filepath.Join(append([]string{driver.RootPath}, paths...)...)
-}
-
 func (driver *GitDriver) Init(conn *server.Conn) {
 }
 
