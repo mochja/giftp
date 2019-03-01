@@ -10,6 +10,8 @@ import (
 
 	"github.com/goftp/server"
 	"gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4/plumbing/object"
+	"time"
 )
 
 type GitDriver struct {
@@ -46,8 +48,16 @@ func (driver *GitDriver) Init(conn *server.Conn) {
 }
 
 func (driver *GitDriver) ChangeDir(path string) error {
-	rPath := driver.realPath(path)
-	f, err := os.Lstat(rPath)
+	r, err := git.PlainOpen(driver.RootPath)
+	if err != nil {
+		return err
+	}
+	tree, err := r.Worktree()
+	if err != nil {
+		return err
+	}
+
+	f, err := tree.Filesystem.Stat(path)
 	if err != nil {
 		return err
 	}
@@ -58,15 +68,20 @@ func (driver *GitDriver) ChangeDir(path string) error {
 }
 
 func (driver *GitDriver) Stat(path string) (server.FileInfo, error) {
-	basepath := driver.realPath(path)
-	rPath, err := filepath.Abs(basepath)
+	r, err := git.PlainOpen(driver.RootPath)
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Lstat(rPath)
+	tree, err := r.Worktree()
 	if err != nil {
 		return nil, err
 	}
+
+	f, err := tree.Filesystem.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
 	mode, err := driver.Perm.GetMode(path)
 	if err != nil {
 		return nil, err
@@ -86,8 +101,6 @@ func (driver *GitDriver) Stat(path string) (server.FileInfo, error) {
 }
 
 func (driver *GitDriver) ListDir(path string, callback func(server.FileInfo) error) error {
-	fmt.Println(driver.RootPath)
-
 	r, err := git.PlainOpen(driver.RootPath)
 	if err != nil {
 		return err
@@ -98,20 +111,33 @@ func (driver *GitDriver) ListDir(path string, callback func(server.FileInfo) err
 		return err
 	}
 
-	fmt.Println(path)
 	files, err := tree.Filesystem.ReadDir(path)
 	if err != nil {
 		return err
 	}
 
+	paths := strings.Split(path, "/")
+
 	for _, file := range files {
-		info, err := tree.Filesystem.Stat(file.Name())
-		owner := "nobody"
-		group := "nobody"
+		rPath := filepath.Join(append(paths, file.Name())...)
+
+		info, err := tree.Filesystem.Stat(rPath)
+		if err != nil {
+			return err
+		}
 
 		mode := info.Mode()
 		if info.IsDir() {
 			mode |= os.ModeDir
+		}
+
+		owner, err := driver.Perm.GetOwner(path)
+		if err != nil {
+			return err
+		}
+		group, err := driver.Perm.GetGroup(path)
+		if err != nil {
+			return err
 		}
 
 		err = callback(&FileInfo{info, mode, owner, group})
@@ -124,48 +150,135 @@ func (driver *GitDriver) ListDir(path string, callback func(server.FileInfo) err
 }
 
 func (driver *GitDriver) DeleteDir(path string) error {
-	rPath := driver.realPath(path)
-	f, err := os.Lstat(rPath)
+	r, err := git.PlainOpen(driver.RootPath)
 	if err != nil {
 		return err
 	}
-	if f.IsDir() {
-		return os.Remove(rPath)
+	tree, err := r.Worktree()
+	if err != nil {
+		return err
 	}
-	return errors.New("Not a directory")
+
+	f, err := tree.Filesystem.Lstat(path)
+	if err != nil {
+		return err
+	}
+
+	if !f.IsDir() {
+		return errors.New("Not a directory")
+	}
+
+	err = tree.Filesystem.Remove(path)
+	if err != nil {
+		return err
+	}
+
+	err = driver.add(path, r)
+	if err != nil {
+		return err
+	}
+
+	return driver.commit(r)
 }
 
 func (driver *GitDriver) DeleteFile(path string) error {
-	rPath := driver.realPath(path)
-	f, err := os.Lstat(rPath)
+	r, err := git.PlainOpen(driver.RootPath)
 	if err != nil {
 		return err
 	}
-	if !f.IsDir() {
-		return os.Remove(rPath)
+	tree, err := r.Worktree()
+	if err != nil {
+		return err
 	}
-	return errors.New("Not a file")
+
+	f, err := tree.Filesystem.Lstat(path)
+	if err != nil {
+		return err
+	}
+
+	if f.IsDir() {
+		return errors.New("Not a file")
+	}
+
+	err = tree.Filesystem.Remove(path)
+	if err != nil {
+		return err
+	}
+
+	err = driver.add(path, r)
+	if err != nil {
+		return err
+	}
+
+	return driver.commit(r)
 }
 
 func (driver *GitDriver) Rename(fromPath string, toPath string) error {
-	oldPath := driver.realPath(fromPath)
-	newPath := driver.realPath(toPath)
-	return os.Rename(oldPath, newPath)
+	r, err := git.PlainOpen(driver.RootPath)
+	if err != nil {
+		return err
+	}
+	tree, err := r.Worktree()
+	if err != nil {
+		return err
+	}
+
+	err = tree.Filesystem.Rename(fromPath, toPath)
+	if err != nil {
+		return err
+	}
+
+	err = driver.add(fromPath, r)
+	if err != nil {
+		return err
+	}
+	err = driver.add(toPath, r)
+	if err != nil {
+		return err
+	}
+
+	return driver.commit(r)
 }
 
 func (driver *GitDriver) MakeDir(path string) error {
-	rPath := driver.realPath(path)
-	return os.MkdirAll(rPath, os.ModePerm)
+	r, err := git.PlainOpen(driver.RootPath)
+	if err != nil {
+		return err
+	}
+	tree, err := r.Worktree()
+	if err != nil {
+		return err
+	}
+
+	err = tree.Filesystem.MkdirAll(path, os.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	err = driver.add(path, r)
+	if err != nil {
+		return err
+	}
+
+	return driver.commit(r)
 }
 
 func (driver *GitDriver) GetFile(path string, offset int64) (int64, io.ReadCloser, error) {
-	rPath := driver.realPath(path)
-	f, err := os.Open(rPath)
+	r, err := git.PlainOpen(driver.RootPath)
+	if err != nil {
+		return 0, nil, err
+	}
+	tree, err := r.Worktree()
 	if err != nil {
 		return 0, nil, err
 	}
 
-	info, err := f.Stat()
+	info, err := tree.Filesystem.Stat(path)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	f, err := tree.Filesystem.Open(path)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -175,10 +288,57 @@ func (driver *GitDriver) GetFile(path string, offset int64) (int64, io.ReadClose
 	return info.Size(), f, nil
 }
 
+func (driver *GitDriver) add(destPath string, r *git.Repository) error {
+	tree, err := r.Worktree()
+	if err != nil {
+		return err
+	}
+
+	addPath, err := filepath.Rel("/", destPath)
+	if err != nil {
+		return err
+	}
+
+	_, err = tree.Add(addPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (driver *GitDriver) commit(r *git.Repository) error {
+	tree, err := r.Worktree()
+	if err != nil {
+		return err
+	}
+
+	_, err = tree.Commit("example go-git commit", &git.CommitOptions{
+		Author: &object.Signature{
+			Name:  "John Doe",
+			Email: "john@doe.org",
+			When:  time.Now(),
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (driver *GitDriver) PutFile(destPath string, data io.Reader, appendData bool) (int64, error) {
-	rPath := driver.realPath(destPath)
+	r, err := git.PlainOpen(driver.RootPath)
+	if err != nil {
+		return 0, err
+	}
+	tree, err := r.Worktree()
+	if err != nil {
+		return 0, err
+	}
+
 	var isExist bool
-	f, err := os.Lstat(rPath)
+	f, err := tree.Filesystem.Lstat(destPath)
 	if err == nil {
 		isExist = true
 		if f.IsDir() {
@@ -198,12 +358,12 @@ func (driver *GitDriver) PutFile(destPath string, data io.Reader, appendData boo
 
 	if !appendData {
 		if isExist {
-			err = os.Remove(rPath)
+			err = tree.Filesystem.Remove(destPath)
 			if err != nil {
 				return 0, err
 			}
 		}
-		f, err := os.Create(rPath)
+		f, err := tree.Filesystem.Create(destPath)
 		if err != nil {
 			return 0, err
 		}
@@ -212,10 +372,21 @@ func (driver *GitDriver) PutFile(destPath string, data io.Reader, appendData boo
 		if err != nil {
 			return 0, err
 		}
+
+		err = driver.add(destPath, r)
+		if err != nil {
+			return 0, err
+		}
+
+		err = driver.commit(r)
+		if err != nil {
+			return 0, err
+		}
+
 		return bytes, nil
 	}
 
-	of, err := os.OpenFile(rPath, os.O_APPEND|os.O_RDWR, 0660)
+	of, err := tree.Filesystem.OpenFile(destPath, os.O_APPEND|os.O_RDWR, 0660)
 	if err != nil {
 		return 0, err
 	}
@@ -227,6 +398,16 @@ func (driver *GitDriver) PutFile(destPath string, data io.Reader, appendData boo
 	}
 
 	bytes, err := io.Copy(of, data)
+	if err != nil {
+		return 0, err
+	}
+
+	err = driver.add(destPath, r)
+	if err != nil {
+		return 0, err
+	}
+
+	err = driver.commit(r)
 	if err != nil {
 		return 0, err
 	}
